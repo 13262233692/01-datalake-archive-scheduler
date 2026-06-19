@@ -5,26 +5,33 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"datalake-archive-scheduler/internal/domain/model"
 	"datalake-archive-scheduler/internal/domain/repository"
 	"datalake-archive-scheduler/pkg/logger"
 
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
 
 type MockPolarDBRepository struct {
-	mu        sync.RWMutex
-	data      map[int64]*model.DataRecord
-	tableName string
-	maxID     int64
+	mu            sync.RWMutex
+	data          map[int64]*model.DataRecord
+	tableName     string
+	maxID         int64
+	activeIters   int64
+	closedIters   int64
+	leakDetectMu  sync.Mutex
+	leakDetectMap map[string]string
 }
 
 func NewMockPolarDBRepository(tableName string) *MockPolarDBRepository {
 	repo := &MockPolarDBRepository{
-		data:      make(map[int64]*model.DataRecord),
-		tableName: tableName,
+		data:          make(map[int64]*model.DataRecord),
+		tableName:     tableName,
+		leakDetectMap: make(map[string]string),
 	}
 	repo.generateMockData()
 	return repo
@@ -128,12 +135,24 @@ func (r *MockPolarDBRepository) FetchShard(ctx context.Context, tableName string
 		zap.Int("batch_size", batchSize),
 	)
 
+	iterID := uuid.New().String()
+	atomic.AddInt64(&r.activeIters, 1)
+
+	r.leakDetectMu.Lock()
+	r.leakDetectMap[iterID] = fmt.Sprintf("shard[%d-%d] created at %s",
+		startID, endID, time.Now().Format(time.RFC3339))
+	r.leakDetectMu.Unlock()
+
 	return &mockDataIterator{
-		repo:     r,
-		startID:  startID,
-		endID:    endID,
-		coldDate: coldDate,
-		current:  startID - 1,
+		repo:         r,
+		iterID:       iterID,
+		startID:      startID,
+		endID:        endID,
+		coldDate:     coldDate,
+		current:      startID - 1,
+		closed:       false,
+		lockHeld:     false,
+		batchSize:    batchSize,
 	}, nil
 }
 
@@ -164,16 +183,42 @@ func (r *MockPolarDBRepository) Close() error {
 }
 
 type mockDataIterator struct {
-	repo     *MockPolarDBRepository
-	startID  int64
-	endID    int64
-	coldDate time.Time
-	current  int64
+	repo      *MockPolarDBRepository
+	iterID    string
+	startID   int64
+	endID     int64
+	coldDate  time.Time
+	current   int64
+	closed    bool
+	lockHeld  bool
+	batchSize int
+}
+
+func (it *mockDataIterator) safeRLock() {
+	it.repo.mu.RLock()
+	it.lockHeld = true
+}
+
+func (it *mockDataIterator) safeRUnlock() {
+	if it.lockHeld {
+		it.repo.mu.RUnlock()
+		it.lockHeld = false
+	}
 }
 
 func (it *mockDataIterator) Next() (*model.DataRecord, error) {
-	it.repo.mu.RLock()
-	defer it.repo.mu.RUnlock()
+	it.safeRLock()
+	defer it.safeRUnlock()
+
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("iterator Next() panic recovered",
+				zap.String("iter_id", it.iterID),
+				zap.Any("panic", r),
+			)
+			it.safeRUnlock()
+		}
+	}()
 
 	for it.current < it.endID {
 		it.current++
@@ -193,8 +238,18 @@ func (it *mockDataIterator) Next() (*model.DataRecord, error) {
 }
 
 func (it *mockDataIterator) HasNext() bool {
-	it.repo.mu.RLock()
-	defer it.repo.mu.RUnlock()
+	it.safeRLock()
+	defer it.safeRUnlock()
+
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("iterator HasNext() panic recovered",
+				zap.String("iter_id", it.iterID),
+				zap.Any("panic", r),
+			)
+			it.safeRUnlock()
+		}
+	}()
 
 	for id := it.current + 1; id <= it.endID; id++ {
 		rec, exists := it.repo.data[id]
@@ -206,5 +261,59 @@ func (it *mockDataIterator) HasNext() bool {
 }
 
 func (it *mockDataIterator) Close() error {
+	if it.closed {
+		return nil
+	}
+
+	it.closed = true
+
+	it.safeRUnlock()
+
+	atomic.AddInt64(&it.repo.activeIters, -1)
+	atomic.AddInt64(&it.repo.closedIters, 1)
+
+	it.repo.leakDetectMu.Lock()
+	delete(it.repo.leakDetectMap, it.iterID)
+	it.repo.leakDetectMu.Unlock()
+
+	logger.Debug("iterator closed safely",
+		zap.String("iter_id", it.iterID),
+		zap.Int64("active_iters", atomic.LoadInt64(&it.repo.activeIters)),
+	)
+
 	return nil
+}
+
+func (r *MockPolarDBRepository) GetActiveIteratorCount() int64 {
+	return atomic.LoadInt64(&r.activeIters)
+}
+
+func (r *MockPolarDBRepository) GetLeakedIterators() map[string]string {
+	r.leakDetectMu.Lock()
+	defer r.leakDetectMu.Unlock()
+
+	result := make(map[string]string, len(r.leakDetectMap))
+	for k, v := range r.leakDetectMap {
+		result[k] = v
+	}
+	return result
+}
+
+func (r *MockPolarDBRepository) ForceCleanupLeakedIterators() int {
+	r.leakDetectMu.Lock()
+	defer r.leakDetectMu.Unlock()
+
+	count := len(r.leakDetectMap)
+	if count > 0 {
+		logger.Warn("force cleaning up leaked iterators",
+			zap.Int("leaked_count", count),
+		)
+
+		atomic.AddInt64(&r.activeIters, -int64(count))
+		atomic.AddInt64(&r.closedIters, int64(count))
+
+		r.leakDetectMap = make(map[string]string)
+	}
+
+	return count
 }

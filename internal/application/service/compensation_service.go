@@ -133,7 +133,7 @@ func (s *CompensationService) ExecuteCompensation(ctx context.Context, task *Com
 			defer func() { <-sem }()
 
 			sh.Start()
-			result := s.processor.ProcessShardSimple(ctx, sh, tableName, coldDate)
+			result := s.processor.ProcessShardSafe(ctx, sh, tableName, coldDate)
 
 			if result.Error != nil {
 				sh.Fail(result.Error.Error())

@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,19 +20,20 @@ import (
 )
 
 type ArchiveAppService struct {
-	config        *config.ArchiveConfig
-	sourceDB      repository.SourceDBRepository
-	ossRepo       repository.OSSRepository
-	hiveRepo      repository.HiveMetastoreRepository
-	starrocksRepo repository.StarRocksRepository
-	processor     *StreamProcessor
-	compensation  *CompensationService
-	cleaningSvc   domainservice.DataCleaningService
-	maskingSvc    domainservice.DataMaskingService
-	mu            sync.RWMutex
-	jobs          map[string]*model.ArchiveJob
-	jobShards     map[string][]*model.ArchiveShard
-	stats         *ArchiveStats
+	config         *config.ArchiveConfig
+	sourceDB       repository.SourceDBRepository
+	ossRepo        repository.OSSRepository
+	hiveRepo       repository.HiveMetastoreRepository
+	starrocksRepo  repository.StarRocksRepository
+	processor      *StreamProcessor
+	shardScheduler *SafeShardScheduler
+	compensation   *CompensationService
+	cleaningSvc    domainservice.DataCleaningService
+	maskingSvc     domainservice.DataMaskingService
+	mu             sync.RWMutex
+	jobs           map[string]*model.ArchiveJob
+	jobShards      map[string][]*model.ArchiveShard
+	stats          *ArchiveStats
 }
 
 type ArchiveStats struct {
@@ -52,19 +54,25 @@ func NewArchiveAppService(
 	cleaningSvc domainservice.DataCleaningService,
 	maskingSvc domainservice.DataMaskingService,
 ) *ArchiveAppService {
+	schedulerConfig := DefaultShardSchedulerConfig()
+	schedulerConfig.MaxConcurrency = cfg.Concurrency
+
+	shardScheduler := NewSafeShardScheduler(processor, schedulerConfig)
+
 	return &ArchiveAppService{
-		config:        cfg,
-		sourceDB:      sourceDB,
-		ossRepo:       ossRepo,
-		hiveRepo:      hiveRepo,
-		starrocksRepo: starrocksRepo,
-		processor:     processor,
-		compensation:  compensation,
-		cleaningSvc:   cleaningSvc,
-		maskingSvc:    maskingSvc,
-		jobs:          make(map[string]*model.ArchiveJob),
-		jobShards:     make(map[string][]*model.ArchiveShard),
-		stats:         &ArchiveStats{},
+		config:         cfg,
+		sourceDB:       sourceDB,
+		ossRepo:        ossRepo,
+		hiveRepo:       hiveRepo,
+		starrocksRepo:  starrocksRepo,
+		processor:      processor,
+		shardScheduler: shardScheduler,
+		compensation:   compensation,
+		cleaningSvc:    cleaningSvc,
+		maskingSvc:     maskingSvc,
+		jobs:           make(map[string]*model.ArchiveJob),
+		jobShards:      make(map[string][]*model.ArchiveShard),
+		stats:          &ArchiveStats{},
 	}
 }
 
@@ -154,6 +162,9 @@ func (s *ArchiveAppService) executeJob(ctx context.Context, jobID string) {
 	job.Start()
 	s.mu.Unlock()
 
+	jobCtx, jobCancel := context.WithTimeout(ctx, 24*time.Hour)
+	defer jobCancel()
+
 	logger.Info("archive job started",
 		zap.String("job_id", jobID),
 		zap.String("job_name", job.JobName),
@@ -161,43 +172,46 @@ func (s *ArchiveAppService) executeJob(ctx context.Context, jobID string) {
 
 	defer func() {
 		if r := recover(); r != nil {
+			stack := debug.Stack()
 			logger.Error("job panic recovered",
 				zap.String("job_id", jobID),
 				zap.Any("panic", r),
+				zap.String("stack", string(stack)),
 			)
 			s.failJob(jobID, fmt.Sprintf("panic: %v", r))
+			jobCancel()
 		}
 	}()
 
-	if err := s.prepareShards(ctx, job); err != nil {
+	if err := s.prepareShards(jobCtx, job); err != nil {
 		logger.Error("prepare shards failed", zap.Error(err))
 		s.failJob(jobID, err.Error())
 		return
 	}
 
-	if err := s.processShards(ctx, job); err != nil {
+	if err := s.processShards(jobCtx, job); err != nil {
 		logger.Error("process shards failed", zap.Error(err))
 
-		if compErr := s.tryCompensate(ctx, job); compErr != nil {
+		if compErr := s.tryCompensate(jobCtx, job); compErr != nil {
 			logger.Error("compensation failed", zap.Error(compErr))
 			s.failJob(jobID, compErr.Error())
 			return
 		}
 	}
 
-	if err := s.registerHivePartition(ctx, job); err != nil {
+	if err := s.registerHivePartition(jobCtx, job); err != nil {
 		logger.Error("register hive partition failed", zap.Error(err))
 		s.failJob(jobID, err.Error())
 		return
 	}
 
-	if err := s.loadToStarRocks(ctx, job); err != nil {
+	if err := s.loadToStarRocks(jobCtx, job); err != nil {
 		logger.Error("load to starrocks failed", zap.Error(err))
 		s.failJob(jobID, err.Error())
 		return
 	}
 
-	if err := s.cleanupSourceData(ctx, job); err != nil {
+	if err := s.cleanupSourceData(jobCtx, job); err != nil {
 		logger.Warn("cleanup source data failed", zap.Error(err))
 	}
 
@@ -256,59 +270,75 @@ func (s *ArchiveAppService) prepareShards(ctx context.Context, job *model.Archiv
 func (s *ArchiveAppService) processShards(ctx context.Context, job *model.ArchiveJob) error {
 	s.mu.RLock()
 	shards := s.jobShards[job.ID]
-	concurrency := job.Concurrency
 	s.mu.RUnlock()
 
-	sem := make(chan struct{}, concurrency)
-	var wg sync.WaitGroup
-	errChan := make(chan error, len(shards))
+	logger.Info("starting safe shard processing",
+		zap.String("job_id", job.ID),
+		zap.Int("total_shards", len(shards)),
+		zap.Int("concurrency", job.Concurrency),
+	)
 
-	var processed int64
-	var failed int64
-
-	for _, shard := range shards {
-		wg.Add(1)
-		sem <- struct{}{}
-
-		go func(sh *model.ArchiveShard) {
-			defer wg.Done()
-			defer func() { <-sem }()
-
-			sh.Start()
-
-			result := s.processor.ProcessShardSimple(ctx, sh, job.TableName, job.ColdDate)
-
-			if result.Error != nil {
-				sh.Fail(result.Error.Error())
-				atomic.AddInt64(&failed, 1)
-				errChan <- result.Error
-				logger.Error("shard processing failed",
-					zap.Int("shard_index", sh.ShardIndex),
-					zap.Error(result.Error),
-				)
-			} else {
-				sh.Complete(result.RecordCount, result.OSSPath)
-				atomic.AddInt64(&processed, result.RecordCount)
-
-				s.mu.Lock()
-				job.ArchivedCount += result.RecordCount
-				s.mu.Unlock()
-			}
-		}(shard)
+	schedulerConfig := DefaultShardSchedulerConfig()
+	schedulerConfig.MaxConcurrency = job.Concurrency
+	schedulerConfig.ShardTimeout = time.Duration(job.ShardCount) * 10 * time.Minute
+	if schedulerConfig.ShardTimeout < 30*time.Minute {
+		schedulerConfig.ShardTimeout = 30 * time.Minute
+	}
+	schedulerConfig.GlobalTimeout = time.Duration(job.ShardCount) * 30 * time.Minute
+	if schedulerConfig.GlobalTimeout < 2*time.Hour {
+		schedulerConfig.GlobalTimeout = 2 * time.Hour
 	}
 
-	wg.Wait()
-	close(errChan)
+	scheduler := NewSafeShardScheduler(s.processor, schedulerConfig)
 
-	failedCount := atomic.LoadInt64(&failed)
+	err := scheduler.ProcessShards(
+		ctx,
+		job,
+		shards,
+		job.TableName,
+		job.ColdDate,
+	)
+
+	if err != nil {
+		logger.Error("shard processing completed with errors",
+			zap.String("job_id", job.ID),
+			zap.Error(err),
+		)
+		return err
+	}
+
+	stats := scheduler.GetStats()
+	logger.Info("shard processing completed",
+		zap.String("job_id", job.ID),
+		zap.Int64("total_shards", stats.TotalShards),
+		zap.Int64("completed_shards", stats.CompletedShards),
+		zap.Int64("failed_shards", stats.FailedShards),
+		zap.Int64("panic_count", stats.PanicCount),
+		zap.Int64("max_goroutines", stats.MaxGoroutines),
+		zap.Duration("duration", time.Since(stats.StartTime)),
+	)
+
+	var totalArchived int64
+	var failedCount int64
+
+	s.mu.RLock()
+	for _, shard := range shards {
+		if shard.Status == model.ShardStatusCompleted {
+			totalArchived += shard.RecordCount
+		} else if shard.Status == model.ShardStatusFailed {
+			failedCount++
+		}
+	}
+	s.mu.RUnlock()
+
+	s.mu.Lock()
+	job.ArchivedCount = totalArchived
+	job.FailedCount = failedCount
+	s.mu.Unlock()
+
 	if failedCount > 0 {
 		return fmt.Errorf("%d shards failed", failedCount)
 	}
-
-	logger.Info("all shards processed",
-		zap.String("job_id", job.ID),
-		zap.Int64("total_records", processed),
-	)
 
 	return nil
 }
