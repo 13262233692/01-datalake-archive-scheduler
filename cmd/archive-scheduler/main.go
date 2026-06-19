@@ -90,7 +90,28 @@ func main() {
 		maskingSvc,
 	)
 
-	r := router.SetupRouter(archiveAppService, cfg.Server.Mode)
+	auditCfg := service.AuditConfig{
+		Enabled:               cfg.Audit.Enabled,
+		SampleRate:            cfg.Audit.SampleRate,
+		BatchSize:             cfg.Audit.BatchSize,
+		Concurrency:           cfg.Audit.Concurrency,
+		QueueCapacity:         cfg.Audit.QueueCapacity,
+		WebhookURL:            cfg.Audit.WebhookURL,
+		WebhookTimeout:        time.Duration(cfg.Audit.WebhookTimeoutSec) * time.Second,
+		MaxRetries:            cfg.Audit.MaxRetries,
+		AlertThresholdMiss:    cfg.Audit.AlertThresholdMiss,
+		AlertThresholdMismatch: cfg.Audit.AlertThresholdMismatch,
+	}
+
+	auditService := service.NewAuditService(auditCfg, sourceDB, starrocksRepo)
+	if auditCfg.Enabled {
+		auditService.Start()
+		defer auditService.Stop()
+	}
+
+	archiveAppService.SetAuditService(auditService)
+
+	r := router.SetupRouter(archiveAppService, auditService, cfg.Server.Mode)
 
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Server.Port),

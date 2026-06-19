@@ -58,3 +58,15 @@ log:
   max_size: 100
   max_backups: 10
   max_age: 30
+
+audit:
+  enabled: true
+  sample_rate: 0.1
+  batch_size: 100
+  concurrency: 4
+  queue_capacity: 100000
+  webhook_url: "https://alert.example.com/webhook/data-audit"
+  webhook_timeout_sec: 10
+  max_retries: 3
+  alert_threshold_miss: 0.01
+  alert_threshold_mismatch: 0.01

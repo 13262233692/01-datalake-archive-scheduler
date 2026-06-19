@@ -194,6 +194,14 @@ func (m *mockStarRocks) GetRecordCount(ctx context.Context, tableName string, pa
 	return 0, nil
 }
 
+func (m *mockStarRocks) GetRecordByID(ctx context.Context, tableName string, id int64) (map[string]interface{}, bool) {
+	return nil, false
+}
+
+func (m *mockStarRocks) GetRecordsByIDRange(ctx context.Context, tableName string, startID, endID int64) ([]map[string]interface{}, error) {
+	return nil, nil
+}
+
 func (m *mockStarRocks) Close() error {
 	return nil
 }

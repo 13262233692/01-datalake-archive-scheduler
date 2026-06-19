@@ -30,6 +30,7 @@ type ArchiveAppService struct {
 	compensation   *CompensationService
 	cleaningSvc    domainservice.DataCleaningService
 	maskingSvc     domainservice.DataMaskingService
+	auditService   *AuditService
 	mu             sync.RWMutex
 	jobs           map[string]*model.ArchiveJob
 	jobShards      map[string][]*model.ArchiveShard
@@ -74,6 +75,10 @@ func NewArchiveAppService(
 		jobShards:      make(map[string][]*model.ArchiveShard),
 		stats:          &ArchiveStats{},
 	}
+}
+
+func (s *ArchiveAppService) SetAuditService(auditService *AuditService) {
+	s.auditService = auditService
 }
 
 func (s *ArchiveAppService) CreateJob(ctx context.Context, req *dto.CreateArchiveJobRequest) (*dto.CreateArchiveJobResponse, error) {
@@ -486,6 +491,39 @@ func (s *ArchiveAppService) completeJob(jobID string) {
 		zap.Int64("archived_count", job.ArchivedCount),
 		zap.Duration("duration", job.EndTime.Sub(job.StartTime)),
 	)
+
+	if s.auditService != nil && s.auditService.IsRunning() {
+		coldDate := s.config.ColdDate()
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Error("audit trigger panic recovered",
+					zap.String("job_id", jobID),
+					zap.Any("panic", r),
+				)
+			}
+			}()
+
+			auditID, err := s.auditService.SubmitAudit(
+				job.ID,
+				job.TableName,
+				"unicorn_pro_history",
+				job.TotalRecords,
+				coldDate,
+			)
+			if err != nil {
+				logger.Warn("failed to submit audit job",
+					zap.String("job_id", jobID),
+					zap.Error(err),
+				)
+				return
+			}
+			logger.Info("audit job submitted",
+				zap.String("archive_job_id", jobID),
+				zap.String("audit_job_id", auditID),
+			)
+		}()
+	}
 }
 
 func (s *ArchiveAppService) failJob(jobID string, errMsg string) {

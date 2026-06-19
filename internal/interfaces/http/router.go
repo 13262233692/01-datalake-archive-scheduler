@@ -8,7 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func SetupRouter(archiveService *service.ArchiveAppService, mode string) *gin.Engine {
+func SetupRouter(archiveService *service.ArchiveAppService, auditService *service.AuditService, mode string) *gin.Engine {
 	gin.SetMode(mode)
 
 	r := gin.New()
@@ -18,6 +18,7 @@ func SetupRouter(archiveService *service.ArchiveAppService, mode string) *gin.En
 	r.Use(middleware.CORSMiddleware())
 
 	archiveHandler := handler.NewArchiveHandler(archiveService)
+	auditHandler := handler.NewAuditHandler(auditService)
 
 	api := r.Group("/api/v1")
 	{
@@ -33,9 +34,19 @@ func SetupRouter(archiveService *service.ArchiveAppService, mode string) *gin.En
 			archive.GET("/jobs/:jobId/shards", archiveHandler.GetShardStatus)
 		}
 
+		audit := api.Group("/audit")
+		{
+			audit.GET("/jobs", auditHandler.ListAuditJobs)
+			audit.GET("/jobs/:auditId", auditHandler.GetAuditJob)
+			audit.GET("/jobs/:auditId/batches", auditHandler.GetAuditBatches)
+			audit.POST("/trigger", auditHandler.TriggerAudit)
+		}
+
 		stats := api.Group("/stats")
 		{
 			stats.GET("", archiveHandler.GetStats)
+			stats.GET("/audit", auditHandler.GetAuditStats)
+			stats.GET("/audit/dashboard", auditHandler.GetDashboard)
 		}
 	}
 

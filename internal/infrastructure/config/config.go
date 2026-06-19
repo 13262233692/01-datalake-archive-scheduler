@@ -14,6 +14,7 @@ type Config struct {
 	Hive      HiveConfig      `mapstructure:"hive"`
 	StarRocks StarRocksConfig `mapstructure:"starrocks"`
 	Archive   ArchiveConfig   `mapstructure:"archive"`
+	Audit     AuditConfig     `mapstructure:"audit"`
 	Log       LogConfig       `mapstructure:"log"`
 }
 
@@ -76,6 +77,19 @@ type ArchiveConfig struct {
 	CronExpr        string        `mapstructure:"cron_expr"`
 }
 
+type AuditConfig struct {
+	Enabled               bool    `mapstructure:"enabled"`
+	SampleRate            float64 `mapstructure:"sample_rate"`
+	BatchSize             int     `mapstructure:"batch_size"`
+	Concurrency           int     `mapstructure:"concurrency"`
+	QueueCapacity         int     `mapstructure:"queue_capacity"`
+	WebhookURL            string  `mapstructure:"webhook_url"`
+	WebhookTimeoutSec     int     `mapstructure:"webhook_timeout_sec"`
+	MaxRetries            int     `mapstructure:"max_retries"`
+	AlertThresholdMiss    float64 `mapstructure:"alert_threshold_miss"`
+	AlertThresholdMismatch float64 `mapstructure:"alert_threshold_mismatch"`
+}
+
 type LogConfig struct {
 	Level    string `mapstructure:"level"`
 	Format   string `mapstructure:"format"`
@@ -135,6 +149,17 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("archive.masking_salt", "archive-salt-default")
 	v.SetDefault("archive.table_name", "order_detail")
 	v.SetDefault("archive.target_table", "unicorn_pro_history")
+
+	v.SetDefault("audit.enabled", true)
+	v.SetDefault("audit.sample_rate", 0.1)
+	v.SetDefault("audit.batch_size", 100)
+	v.SetDefault("audit.concurrency", 2)
+	v.SetDefault("audit.queue_capacity", 10000)
+	v.SetDefault("audit.webhook_url", "")
+	v.SetDefault("audit.webhook_timeout_sec", 10)
+	v.SetDefault("audit.max_retries", 3)
+	v.SetDefault("audit.alert_threshold_miss", 0.05)
+	v.SetDefault("audit.alert_threshold_mismatch", 0.05)
 
 	v.SetDefault("log.level", "info")
 	v.SetDefault("log.format", "json")

@@ -10,5 +10,7 @@ type StarRocksRepository interface {
 	ExecuteSQL(ctx context.Context, sql string) error
 	TableExists(ctx context.Context, tableName string) (bool, error)
 	GetRecordCount(ctx context.Context, tableName string, partition string) (int64, error)
+	GetRecordByID(ctx context.Context, tableName string, id int64) (map[string]interface{}, bool)
+	GetRecordsByIDRange(ctx context.Context, tableName string, startID, endID int64) ([]map[string]interface{}, error)
 	Close() error
 }
