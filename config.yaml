@@ -1,0 +1,60 @@
+server:
+  port: 8080
+  mode: debug
+  read_timeout: 60
+  write_timeout: 60
+
+database:
+  driver: mysql
+  host: polardb-instance.example.com
+  port: 3306
+  user: archive_user
+  password: ${DB_PASSWORD}
+  dbname: business_db
+  max_open_conn: 100
+  max_idle_conn: 20
+  max_lifetime: 3600
+
+oss:
+  endpoint: oss-cn-hangzhou.aliyuncs.com
+  access_key: ${OSS_ACCESS_KEY}
+  secret_key: ${OSS_SECRET_KEY}
+  bucket: datalake-archive-bucket
+  path_prefix: archive
+  region: cn-hangzhou
+  use_ssl: true
+
+hive:
+  metastore_uri: thrift://hive-metastore.example.com:9083
+  database: unicorn
+  username: hive
+  password: ${HIVE_PASSWORD}
+
+starrocks:
+  host: starrocks-fe.example.com
+  port: 9030
+  user: archive_user
+  password: ${STARROCKS_PASSWORD}
+  database: unicorn
+  load_url: http://starrocks-fe.example.com:8030
+
+archive:
+  cold_years: 3
+  shard_count: 10
+  concurrency: 5
+  batch_size: 1000
+  max_retry_count: 3
+  memory_limit_mb: 512
+  stream_buffer_size: 100
+  masking_salt: "datalake-archive-2024"
+  table_name: order_detail
+  target_table: unicorn_pro_history
+  cron_expr: "0 2 3 * * ?"
+
+log:
+  level: info
+  format: json
+  file_path: /var/log/archive-scheduler
+  max_size: 100
+  max_backups: 10
+  max_age: 30
